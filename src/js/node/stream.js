@@ -4296,7 +4296,7 @@ var require_writable = __commonJS({
     Writable.fromWeb = function (writableStream, options) {
       return webStreamsAdapters.newStreamWritableFromWritableStream(writableStream, options);
     };
-    Writable.toWeb = function (streamWritable, options) {
+    Writable.toWeb = function (streamWritable) {
       return webStreamsAdapters.newWritableStreamFromStreamWritable(streamWritable);
     };
   },
