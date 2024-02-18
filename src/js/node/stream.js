@@ -4012,16 +4012,292 @@ var require_writable = __commonJS({
     Writable.prototype[EE.captureRejectionSymbol] = function (err) {
       this.destroy(err);
     };
-    var webStreamsAdapters;
-    function lazyWebStreams() {
-      if (webStreamsAdapters === void 0) webStreamsAdapters = {};
-      return webStreamsAdapters;
+
+    /**
+     * @param {WritableStream} writableStream
+     * @param {{
+     *   decodeStrings? : boolean,
+     *   highWaterMark? : number,
+     *   objectMode? : boolean,
+     *   signal? : AbortSignal,
+     * }} [options]
+     * @returns {Writable}
+     */
+    function newStreamWritableFromWritableStream(writableStream, options = {}) {
+      if (!isWritableStream(writableStream)) {
+        throw new ERR_INVALID_ARG_TYPE("writableStream", "WritableStream", writableStream);
+      }
+
+      validateObject(options, "options");
+      const { highWaterMark, decodeStrings = true, objectMode = flase, signal } = options;
+
+      validateBoolean(objectMode, "options.objectMode");
+      validateBoolean(decodeStrings, "options.decodeStrings");
+
+      const writer = writableStream.getWriter();
+      let closed = false;
+
+      const writable = new Writable({
+        highWaterMark,
+        objectMode,
+        decodeStrings,
+        signal,
+
+        writev(chunks, callback) {
+          function done(error) {
+            error = error.filter(e => e);
+            try {
+              callback(error.length === 0 ? undefined : error);
+            } catch (error) {
+              // In a next tick because this is happening within
+              // a promise context, and if there are any errors
+              // thrown we don't want those to cause an unhandled
+              // rejection. Let's just escape the promise and
+              // handle it separately.
+              process.nextTick(() => destroy(writable, error));
+            }
+          }
+          // Wrapping on a new Promise is necessary to not expose the SafePromise
+          // prototype to user-land.
+          primordials.SafePromiseAll = (promises, mapFn) =>
+            new Promise((a, b) => SafePromise.all(arrayToSafePromiseIterable(promises, mapFn)).then(a, b));
+
+          PromisePrototypeThen(
+            writer.ready,
+            () => {
+              return PromisePrototypeThen(
+                SafePromiseAll(chunks, data => writer.write(data.chunk)),
+                done,
+                done,
+              );
+            },
+            done,
+          );
+        },
+
+        write(chunk, encoding, callback) {
+          if (typeof chunk === "string" && decodeStrings && !objectMode) {
+            const enc = normalizeEncoding(encoding);
+
+            if (enc === "utf8") {
+              chunk = encoder.encode(chunk);
+            } else {
+              chunk = Buffer.from(chunk, encoding);
+              chunk = new Uint8Array(
+                TypedArrayPrototypeGetBuffer(chunk),
+                TypedArrayPrototypeGetByteOffset(chunk),
+                TypedArrayPrototypeGetByteLength(chunk),
+              );
+            }
+          }
+
+          function done(error) {
+            try {
+              callback(error);
+            } catch (error) {
+              destroy(writable, error);
+            }
+          }
+
+          PromisePrototypeThen(
+            writer.ready,
+            () => {
+              return PromisePrototypeThen(writer.write(chunk), done, done);
+            },
+            done,
+          );
+        },
+
+        destroy(error, callback) {
+          function done() {
+            try {
+              callback(error);
+            } catch (error) {
+              // In a next tick because this is happening within
+              // a promise context, and if there are any errors
+              // thrown we don't want those to cause an unhandled
+              // rejection. Let's just escape the promise and
+              // handle it separately.
+              process.nextTick(() => {
+                throw error;
+              });
+            }
+          }
+
+          if (!closed) {
+            if (error != null) {
+              PromisePrototypeThen(writer.abort(error), done, done);
+            } else {
+              PromisePrototypeThen(writer.close(), done, done);
+            }
+            return;
+          }
+
+          done();
+        },
+
+        final(callback) {
+          function done(error) {
+            try {
+              callback(error);
+            } catch (error) {
+              // In a next tick because this is happening within
+              // a promise context, and if there are any errors
+              // thrown we don't want those to cause an unhandled
+              // rejection. Let's just escape the promise and
+              // handle it separately.
+              process.nextTick(() => destroy(writable, error));
+            }
+          }
+
+          if (!closed) {
+            PromisePrototypeThen(writer.close(), done, done);
+          }
+        },
+      });
+
+      PromisePrototypeThen(
+        writer.closed,
+        () => {
+          // If the WritableStream closes before the stream.Writable has been
+          // ended, we signal an error on the stream.Writable.
+          closed = true;
+          if (!isWritableEnded(writable)) destroy(writable, new ERR_STREAM_PREMATURE_CLOSE());
+        },
+        error => {
+          // If the WritableStream errors before the stream.Writable has been
+          // destroyed, signal an error on the stream.Writable.
+          closed = true;
+          destroy(writable, error);
+        },
+      );
+
+      return writable;
     }
-    Writable.fromWeb = function (writableStream, options) {
-      return lazyWebStreams().newStreamWritableFromWritableStream(writableStream, options);
+
+    /**
+     * @typedef {import('../../stream').Writable} Writable
+     * @typedef {import('../../stream').Readable} Readable
+     * @typedef {import('./writablestream').WritableStream} WritableStream
+     * @typedef {import('./readablestream').ReadableStream} ReadableStream
+     */
+
+    /**
+     * @typedef {import('../abort_controller').AbortSignal} AbortSignal
+     */
+
+    /**
+     * @param {Writable} streamWritable
+     * @returns {WritableStream}
+     */
+    function newWritableStreamFromStreamWritable(streamWritable) {
+      // Not using the internal/streams/utils isWritableNodeStream utility
+      // here because it will return false if streamWritable is a Duplex
+      // whose writable option is false. For a Duplex that is not writable,
+      // we want it to pass this check but return a closed WritableStream.
+      // We check if the given stream is a stream.Writable or http.OutgoingMessage
+      const checkIfWritableOrOutgoingMessage =
+        streamWritable && typeof streamWritable?.write === "function" && typeof streamWritable?.on === "function";
+      if (!checkIfWritableOrOutgoingMessage) {
+        throw new ERR_INVALID_ARG_TYPE("streamWritable", "stream.Writable", streamWritable);
+      }
+
+      if (isDestroyed(streamWritable) || !isWritable(streamWritable)) {
+        const writable = new WritableStream();
+        writable.close();
+        return writable;
+      }
+
+      const highWaterMark = streamWritable.writableHighWaterMark;
+      const strategy = streamWritable.writableObjectMode
+        ? new CountQueuingStrategy({ highWaterMark })
+        : { highWaterMark };
+
+      let controller;
+      let backpressurePromise;
+      let closed;
+
+      function onDrain() {
+        if (backpressurePromise !== undefined) backpressurePromise.resolve();
+      }
+
+      const cleanup = finished(streamWritable, error => {
+        error = handleKnownInternalErrors(error);
+
+        cleanup();
+        // This is a protection against non-standard, legacy streams
+        // that happen to emit an error event again after finished is called.
+        streamWritable.on("error", () => {});
+        if (error != null) {
+          if (backpressurePromise !== undefined) backpressurePromise.reject(error);
+          // If closed is not undefined, the error is happening
+          // after the WritableStream close has already started.
+          // We need to reject it here.
+          if (closed !== undefined) {
+            closed.reject(error);
+            closed = undefined;
+          }
+          controller.error(error);
+          controller = undefined;
+          return;
+        }
+
+        if (closed !== undefined) {
+          closed.resolve();
+          closed = undefined;
+          return;
+        }
+        controller.error(new AbortError());
+        controller = undefined;
+      });
+
+      streamWritable.on("drain", onDrain);
+
+      return new WritableStream(
+        {
+          start(c) {
+            controller = c;
+          },
+
+          async write(chunk) {
+            if (streamWritable.writableNeedDrain || !streamWritable.write(chunk)) {
+              backpressurePromise = createDeferredPromise();
+              return SafePromisePrototypeFinally(backpressurePromise.promise, () => {
+                backpressurePromise = undefined;
+              });
+            }
+          },
+
+          abort(reason) {
+            destroy(streamWritable, reason);
+          },
+
+          close() {
+            if (closed === undefined && !isWritableEnded(streamWritable)) {
+              closed = createDeferredPromise();
+              streamWritable.end();
+              return closed.promise;
+            }
+
+            controller = undefined;
+            return PromiseResolve();
+          },
+        },
+        strategy,
+      );
+    }
+
+    var webStreamsAdapters = {
+      newStreamWritableFromWritableStream,
+
+      newWritableStreamFromStreamWritable,
     };
-    Writable.toWeb = function (streamWritable) {
-      return lazyWebStreams().newWritableStreamFromStreamWritable(streamWritable);
+
+    Writable.fromWeb = function (writableStream, options) {
+      return webStreamsAdapters.newStreamWritableFromWritableStream(writableStream, options);
+    };
+    Writable.toWeb = function (streamWritable, options) {
+      return webStreamsAdapters.newWritableStreamFromStreamWritable(streamWritable);
     };
   },
 });
